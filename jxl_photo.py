@@ -72,11 +72,6 @@ class ToolConfig:
 class ConfigManager:
     """Manages persistent configuration for jxl_tools"""
 
-    def __init__(self):
-        self.config_path = self._get_config_path()
-        self.config = ToolConfig()
-        self._load_config()
-
     def _get_config_path(self) -> Path:
         # Check script folder first (if settings file exists there, use it)
         script_config = SCRIPT_DIR / ".jxl_tools_config.json"
@@ -100,6 +95,11 @@ class ConfigManager:
             except Exception as e:
                 print(f"Warning: Corrupted config file: {e}. Using defaults.")
                 self.config = ToolConfig()
+
+    def __init__(self):
+        self.config_path = self._get_config_path()
+        self.config = ToolConfig()
+        self._load_config()
 
     def save_config(self) -> None:
         try:
@@ -135,6 +135,15 @@ class ConfigManager:
         self.config.dependencies_checked = True
         self.save_config()
 
+    def _check_tiff_support(self) -> bool:
+        """Check tifffile via import - always test directly"""
+        try:
+            import tifffile
+            import numpy
+            return True
+        except ImportError:
+            return False
+
     def get_available_features(self) -> Dict[str, bool]:
         return {
             'cjxl': self.config.cjxl_path is not None,
@@ -144,15 +153,6 @@ class ConfigManager:
             'icc_profiles': self.config.magick_path is not None,
             'tiff': self._check_tiff_support(),
         }
-
-    def _check_tiff_support(self) -> bool:
-        """Check tifffile via import - always test directly"""
-        try:
-            import tifffile
-            import numpy
-            return True
-        except ImportError:
-            return False
 
 
 class DependencyChecker:
@@ -177,6 +177,40 @@ class DependencyChecker:
             import rich.prompt
             return True
         except ImportError:
+            return False
+
+    def _detect_tool(self, cmd: str) -> Optional[str]:
+        variations = [cmd]
+        if platform.system() == "Windows":
+            variations.extend([f"{cmd}.exe", f"{cmd}.cmd", f"{cmd}.bat"])
+
+        for variant in variations:
+            path = shutil.which(variant)
+            if path:
+                return path
+
+        if platform.system() == "Windows":
+            common_paths = [
+                Path(r"C:\\Program Files\\libjxl\\bin"),
+                Path(r"C:\\Program Files (x86)\\libjxl\\bin"),
+                Path(r"C:\\Program Files\\ImageMagick"),
+                Path.home() / "bin",
+            ]
+            for base_path in common_paths:
+                if base_path.exists():
+                    for ext in ['.exe', '.cmd', '']:
+                        full_path = base_path / f"{cmd}{ext}"
+                        if full_path.exists():
+                            return str(full_path)
+        return None
+
+    def _test_tool_execution(self, path: str, args: List[str]) -> bool:
+        try:
+            result = subprocess.run([path] + args, capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=10, shell=False)
+            return result.returncode == 0
+        except:
             return False
 
     def check_dependencies(self, force: bool = False) -> Dict[str, bool]:
@@ -213,40 +247,6 @@ class DependencyChecker:
         self.config.save_config()
 
         return status
-
-    def _detect_tool(self, cmd: str) -> Optional[str]:
-        variations = [cmd]
-        if platform.system() == "Windows":
-            variations.extend([f"{cmd}.exe", f"{cmd}.cmd", f"{cmd}.bat"])
-
-        for variant in variations:
-            path = shutil.which(variant)
-            if path:
-                return path
-
-        if platform.system() == "Windows":
-            common_paths = [
-                Path(r"C:\\Program Files\\libjxl\\bin"),
-                Path(r"C:\\Program Files (x86)\\libjxl\\bin"),
-                Path(r"C:\\Program Files\\ImageMagick"),
-                Path.home() / "bin",
-            ]
-            for base_path in common_paths:
-                if base_path.exists():
-                    for ext in ['.exe', '.cmd', '']:
-                        full_path = base_path / f"{cmd}{ext}"
-                        if full_path.exists():
-                            return str(full_path)
-        return None
-
-    def _test_tool_execution(self, path: str, args: List[str]) -> bool:
-        try:
-            result = subprocess.run([path] + args, capture_output=True,
-                                  text=True, encoding="utf-8", errors="replace",
-                                  timeout=10, shell=False)
-            return result.returncode == 0
-        except:
-            return False
 
     def format_status_line(self, status: Dict[str, bool]) -> str:
         """Format dependency status - SINGLE LINE"""
@@ -354,6 +354,12 @@ class InteractiveMenu:
                     return choice
                 print(f"Invalid choice. Valid options: {', '.join(valid_choices)}")
 
+    def _print_success(self, message: str) -> None:
+        if RICH_AVAILABLE and console:
+            console.print(f"[green]✓[/green] {message}")
+        else:
+            print(f"✓ {message}")
+
     def edit_settings(self) -> None:
         current = self.config.config
 
@@ -409,50 +415,11 @@ class InteractiveMenu:
         self.config.save_config()
         self._print_success("Settings saved!")
 
-    def run_wizard(self, status: Dict[str, bool]) -> Optional[Dict[str, Any]]:
-        """Main workflow wizard with 3-tier parameters"""
-        # Initialize with memorized or default values
-        last_staging = self.config.config.last_staging
-        if last_staging is None:
-            last_staging = self.config.config.staging_dir
-
-        workflow = {
-            'input_dir': None,
-            'origin_format': None,
-            'dest_format': None,
-            'conversion_type': None,
-            'mode': None,
-            'workers': self.config.config.last_workers or self.config.config.default_workers,
-            'quality': self.config.config.last_quality or self.config.config.default_quality,
-            'effort': self.config.config.last_effort or self.config.config.default_effort,
-            'staging': last_staging,
-            'selected_files': [],
-            'icc_profile': None,
-            'use_ram': True,
-            'compression': 'zip',
-            'bit_depth': 16,
-            'dry_run': False,
-            'advanced_options': {},
-            'expert_flags': '',
-            'mode_config': {},
-        }
-
-        if not self._wizard_select_origin(workflow, status):
-            return None
-        if not self._wizard_select_destination(workflow, status):
-            return None
-        if not self._wizard_select_files(workflow):
-            return None
-        if not self._wizard_select_mode(workflow):
-            return None
-        if not self._wizard_mode_specific_config(workflow):
-            return None
-        if not self._wizard_parameters_basic(workflow, status):
-            return None
-        if not self._wizard_confirm(workflow):
-            return None
-
-        return workflow
+    def _print_error(self, message: str) -> None:
+        if RICH_AVAILABLE and console:
+            console.print(f"[red]✗[/red] {message}")
+        else:
+            print(f"✗ {message}")
 
     def _wizard_select_origin(self, workflow: Dict, status: Dict[str, bool]) -> bool:
         """Step 1: Select source format - NO PNG"""
@@ -734,6 +701,29 @@ class InteractiveMenu:
 
         return choice
 
+    def _confirm_archive_mode(self) -> bool:
+        from datetime import datetime
+        now = datetime.now()
+        token = now.strftime("%H%M")
+
+        if RICH_AVAILABLE and console:
+            console.print("[bold red]⚠️  DELETE ORIGINALS MODE[/bold red]")
+            console.print("[red]Original files will be DELETED[/red]")
+            console.print(f"Enter current time ({token}) to confirm:")
+        else:
+            print("\n⚠️  DELETE ORIGINALS MODE")
+            print("⚠️  Original files will be DELETED")
+            print(f"Enter {token} to confirm:")
+
+        user_input = input("> ").strip()
+
+        if user_input != token:
+            self._print_error("Confirmation failed!")
+            return False
+
+        self._print_success("Confirmed!")
+        return True
+
     def _wizard_select_mode(self, workflow: Dict) -> bool:
         """Step 4: Organization Modes 0-8"""
         origin = workflow['origin_format']
@@ -913,28 +903,173 @@ class InteractiveMenu:
         workflow['mode_config'] = mode_config
         return True
 
-    def _confirm_archive_mode(self) -> bool:
-        from datetime import datetime
-        now = datetime.now()
-        token = now.strftime("%H%M")
+    def _wizard_parameters_expert(self, workflow: Dict) -> bool:
+        """Step 6B: Expert Mode (free-form flags)"""
+        if RICH_AVAILABLE and console:
+            console.print("\n[bold cyan]Step 6B: Expert Mode[/bold cyan]")
+            show_expert = Confirm.ask("Add custom command-line flags?", default=False)
+        else:
+            print("\n--- Step 6B: Expert Mode ---")
+            expert_input = input("Add custom flags? [y/N]: ").strip().lower()
+            show_expert = expert_input.startswith('y')
+
+        if show_expert:
+            if RICH_AVAILABLE and console:
+                console.print("[dim]Enter any additional flags as they would appear on command line:[/dim]")
+                console.print("[dim]Example: --strip --resize 50% --effort 10[/dim]")
+                expert_flags = Prompt.ask("Custom flags", default="")
+            else:
+                print("Enter additional flags (e.g., --strip --resize 50% --effort 10):")
+                expert_flags = input("> ").strip()
+
+            workflow['expert_flags'] = expert_flags
+
+        return True
+
+    def _wizard_parameters_advanced(self, workflow: Dict, status: Dict[str, bool]) -> bool:
+        """Step 6A: Advanced Options (optional)"""
+        conv_type = workflow['conversion_type']
+        origin = workflow['origin_format']
+        dest = workflow['dest_format']
+
+        advanced_options = {}
 
         if RICH_AVAILABLE and console:
-            console.print("[bold red]⚠️  DELETE ORIGINALS MODE[/bold red]")
-            console.print("[red]Original files will be DELETED[/red]")
-            console.print(f"Enter current time ({token}) to confirm:")
+            console.print("\n[bold cyan]Step 6A: Advanced Options[/bold cyan]")
+            show_advanced = Confirm.ask("Configure advanced options?", default=False)
         else:
-            print("\n⚠️  DELETE ORIGINALS MODE")
-            print("⚠️  Original files will be DELETED")
-            print(f"Enter {token} to confirm:")
+            print("\n--- Step 6A: Advanced Options ---")
+            adv_input = input("Configure advanced options? [y/N]: ").strip().lower()
+            show_advanced = adv_input.startswith('y')
 
-        user_input = input("> ").strip()
+        if not show_advanced:
+            # Convert overwrite_mode from Step 6 into overwrite/sync flags
+            ow_mode = workflow.get('overwrite_mode', '2')
+            if ow_mode == "1":
+                advanced_options['overwrite'] = True
+                advanced_options['sync'] = False
+            elif ow_mode == "2":
+                advanced_options['overwrite'] = False
+                advanced_options['sync'] = True
+            else:
+                advanced_options['overwrite'] = False
+                advanced_options['sync'] = False
+            # Preserve d50_patch and encode_tag from Step 6 (they were set there)
+            if origin == 'tiff' and dest == 'jxl':
+                advanced_options['d50_patch'] = workflow.get('d50_patch', 'auto')
+                advanced_options['encode_tag'] = workflow.get('encode_tag', 'xmp')
+            workflow['advanced_options'] = advanced_options
+            return self._wizard_parameters_expert(workflow)
 
-        if user_input != token:
-            self._print_error("Confirmation failed!")
-            return False
+        # Script-specific advanced options
+        if origin == 'tiff' and dest == 'jxl':
+            # jxl_tiff_encoder advanced options
+            if RICH_AVAILABLE and console:
+                strip_meta = Confirm.ask("Strip metadata?", default=False)
+                encode_tag = Prompt.ask("Encode tag location", choices=["xmp", "software", "off"], default="xmp")
+                # D50 patch already asked in Step 6
+                # Overwrite mode already asked in Step 6
+                overwrite_mode = workflow.get('overwrite_mode', '2')
+                delete_src = Confirm.ask("Delete source TIFFs after conversion? (mode 8)", default=False)
+            else:
+                strip_input = input("Strip metadata? [y/N]: ").strip().lower()
+                strip_meta = strip_input.startswith('y')
+                encode_tag_input = input("Encode tag (xmp/software/off) [xmp]: ").strip().lower() or "xmp"
+                encode_tag = encode_tag_input if encode_tag_input in ["xmp", "software", "off"] else "xmp"
+                # D50 patch already asked in Step 6
+                overwrite_mode = workflow.get('overwrite_mode', '2')
+                delete_src_input = input("Delete source TIFFs after conversion? [y/N]: ").strip().lower()
+                delete_src = delete_src_input.startswith('y')
 
-        self._print_success("Confirmed!")
-        return True
+            # Parse overwrite mode
+            if overwrite_mode == "1":
+                overwrite, sync = True, False
+            elif overwrite_mode == "2":
+                overwrite, sync = False, True
+            else:
+                overwrite, sync = False, False
+
+            advanced_options['strip'] = strip_meta
+            advanced_options['encode_tag'] = encode_tag
+            advanced_options['d50_patch'] = workflow.get('d50_patch', 'auto')
+            advanced_options['overwrite'] = overwrite
+            advanced_options['sync'] = sync
+            advanced_options['delete_source'] = delete_src
+
+        elif origin == 'jxl' and dest == 'tiff':
+            # jxl_tiff_decoder advanced options
+            if RICH_AVAILABLE and console:
+                use_matrix = Confirm.ask("Use ICC matrix conversion?", default=False)
+                use_basic = Confirm.ask("Use basic ICC mode?", default=False) if not use_matrix else False
+                target_icc = Prompt.ask("Target ICC profile", choices=["", "sRGB", "Adobe RGB", "ProPhoto", "custom"], default="")
+                no_cleanup = Confirm.ask("Skip ICC cleanup?", default=False)
+                overwrite_mode = workflow.get('overwrite_mode', '2')
+                delete_src = Confirm.ask("Delete source JXLs after conversion? (mode 8)", default=False)
+            else:
+                matrix_input = input("Use ICC matrix conversion? [y/N]: ").strip().lower()
+                use_matrix = matrix_input.startswith('y')
+                use_basic = False
+                if not use_matrix:
+                    basic_input = input("Use basic ICC mode? [y/N]: ").strip().lower()
+                    use_basic = basic_input.startswith('y')
+                target_icc = input("Target ICC (sRGB/Adobe RGB/ProPhoto/custom/empty): ").strip()
+                cleanup_input = input("Skip ICC cleanup? [y/N]: ").strip().lower()
+                no_cleanup = cleanup_input.startswith('y')
+                overwrite_mode = workflow.get('overwrite_mode', '2')
+                delete_src_input = input("Delete source JXLs after conversion? [y/N]: ").strip().lower()
+                delete_src = delete_src_input.startswith('y')
+
+            # Parse overwrite mode
+            if overwrite_mode == "1":
+                overwrite, sync = True, False
+            elif overwrite_mode == "2":
+                overwrite, sync = False, True
+            else:
+                overwrite, sync = False, False
+
+            advanced_options['matrix'] = use_matrix
+            advanced_options['basic'] = use_basic
+            advanced_options['target_icc'] = target_icc if target_icc else None
+            advanced_options['no_icc_cleanup'] = no_cleanup
+            advanced_options['overwrite'] = overwrite
+            advanced_options['sync'] = sync
+            advanced_options['delete_source'] = delete_src
+
+        else:
+            # jxl_jpeg_transcoder advanced options
+            if RICH_AVAILABLE and console:
+                no_md5 = Confirm.ask("Skip MD5 verification? (faster)", default=False)
+                no_verify = Confirm.ask("Skip validation? (faster, risky)", default=False)
+                overwrite_mode = workflow.get('overwrite_mode', '2')
+                delete_src = Confirm.ask("Delete source after conversion?", default=False)
+                output_suffix = Prompt.ask("Output suffix (e.g., _converted)", default="")
+            else:
+                md5_input = input("Skip MD5 verification? [y/N]: ").strip().lower()
+                no_md5 = md5_input.startswith('y')
+                verify_input = input("Skip validation? [y/N]: ").strip().lower()
+                no_verify = verify_input.startswith('y')
+                overwrite_mode = workflow.get('overwrite_mode', '2')
+                del_input = input("Delete source after? [y/N]: ").strip().lower()
+                delete_src = del_input.startswith('y')
+                output_suffix = input("Output suffix (e.g., _converted): ").strip()
+
+            # Parse overwrite mode
+            if overwrite_mode == "1":
+                overwrite, sync = True, False
+            elif overwrite_mode == "2":
+                overwrite, sync = False, True
+            else:
+                overwrite, sync = False, False
+
+            advanced_options['no_md5'] = no_md5
+            advanced_options['no_verify'] = no_verify
+            advanced_options['overwrite'] = overwrite
+            advanced_options['sync'] = sync
+            advanced_options['delete_source'] = delete_src
+            advanced_options['output_suffix'] = output_suffix if output_suffix else None
+
+        workflow['advanced_options'] = advanced_options
+        return self._wizard_parameters_expert(workflow)
 
     def _wizard_parameters_basic(self, workflow: Dict, status: Dict[str, bool]) -> bool:
         """Step 6: Basic Parameters (always shown)"""
@@ -1091,174 +1226,6 @@ class InteractiveMenu:
         # Now ask for advanced options
         return self._wizard_parameters_advanced(workflow, status)
 
-    def _wizard_parameters_advanced(self, workflow: Dict, status: Dict[str, bool]) -> bool:
-        """Step 6A: Advanced Options (optional)"""
-        conv_type = workflow['conversion_type']
-        origin = workflow['origin_format']
-        dest = workflow['dest_format']
-
-        advanced_options = {}
-
-        if RICH_AVAILABLE and console:
-            console.print("\n[bold cyan]Step 6A: Advanced Options[/bold cyan]")
-            show_advanced = Confirm.ask("Configure advanced options?", default=False)
-        else:
-            print("\n--- Step 6A: Advanced Options ---")
-            adv_input = input("Configure advanced options? [y/N]: ").strip().lower()
-            show_advanced = adv_input.startswith('y')
-
-        if not show_advanced:
-            # Convert overwrite_mode from Step 6 into overwrite/sync flags
-            ow_mode = workflow.get('overwrite_mode', '2')
-            if ow_mode == "1":
-                advanced_options['overwrite'] = True
-                advanced_options['sync'] = False
-            elif ow_mode == "2":
-                advanced_options['overwrite'] = False
-                advanced_options['sync'] = True
-            else:
-                advanced_options['overwrite'] = False
-                advanced_options['sync'] = False
-            # Preserve d50_patch and encode_tag from Step 6 (they were set there)
-            if origin == 'tiff' and dest == 'jxl':
-                advanced_options['d50_patch'] = workflow.get('d50_patch', 'auto')
-                advanced_options['encode_tag'] = workflow.get('encode_tag', 'xmp')
-            workflow['advanced_options'] = advanced_options
-            return self._wizard_parameters_expert(workflow)
-
-        # Script-specific advanced options
-        if origin == 'tiff' and dest == 'jxl':
-            # jxl_tiff_encoder advanced options
-            if RICH_AVAILABLE and console:
-                strip_meta = Confirm.ask("Strip metadata?", default=False)
-                encode_tag = Prompt.ask("Encode tag location", choices=["xmp", "software", "off"], default="xmp")
-                # D50 patch already asked in Step 6
-                # Overwrite mode already asked in Step 6
-                overwrite_mode = workflow.get('overwrite_mode', '2')
-                delete_src = Confirm.ask("Delete source TIFFs after conversion? (mode 8)", default=False)
-            else:
-                strip_input = input("Strip metadata? [y/N]: ").strip().lower()
-                strip_meta = strip_input.startswith('y')
-                encode_tag_input = input("Encode tag (xmp/software/off) [xmp]: ").strip().lower() or "xmp"
-                encode_tag = encode_tag_input if encode_tag_input in ["xmp", "software", "off"] else "xmp"
-                # D50 patch already asked in Step 6
-                overwrite_mode = workflow.get('overwrite_mode', '2')
-                delete_src_input = input("Delete source TIFFs after conversion? [y/N]: ").strip().lower()
-                delete_src = delete_src_input.startswith('y')
-
-            # Parse overwrite mode
-            if overwrite_mode == "1":
-                overwrite, sync = True, False
-            elif overwrite_mode == "2":
-                overwrite, sync = False, True
-            else:
-                overwrite, sync = False, False
-
-            advanced_options['strip'] = strip_meta
-            advanced_options['encode_tag'] = encode_tag
-            advanced_options['d50_patch'] = workflow.get('d50_patch', 'auto')
-            advanced_options['overwrite'] = overwrite
-            advanced_options['sync'] = sync
-            advanced_options['delete_source'] = delete_src
-
-        elif origin == 'jxl' and dest == 'tiff':
-            # jxl_tiff_decoder advanced options
-            if RICH_AVAILABLE and console:
-                use_matrix = Confirm.ask("Use ICC matrix conversion?", default=False)
-                use_basic = Confirm.ask("Use basic ICC mode?", default=False) if not use_matrix else False
-                target_icc = Prompt.ask("Target ICC profile", choices=["", "sRGB", "Adobe RGB", "ProPhoto", "custom"], default="")
-                no_cleanup = Confirm.ask("Skip ICC cleanup?", default=False)
-                overwrite_mode = workflow.get('overwrite_mode', '2')
-                delete_src = Confirm.ask("Delete source JXLs after conversion? (mode 8)", default=False)
-            else:
-                matrix_input = input("Use ICC matrix conversion? [y/N]: ").strip().lower()
-                use_matrix = matrix_input.startswith('y')
-                use_basic = False
-                if not use_matrix:
-                    basic_input = input("Use basic ICC mode? [y/N]: ").strip().lower()
-                    use_basic = basic_input.startswith('y')
-                target_icc = input("Target ICC (sRGB/Adobe RGB/ProPhoto/custom/empty): ").strip()
-                cleanup_input = input("Skip ICC cleanup? [y/N]: ").strip().lower()
-                no_cleanup = cleanup_input.startswith('y')
-                overwrite_mode = workflow.get('overwrite_mode', '2')
-                delete_src_input = input("Delete source JXLs after conversion? [y/N]: ").strip().lower()
-                delete_src = delete_src_input.startswith('y')
-
-            # Parse overwrite mode
-            if overwrite_mode == "1":
-                overwrite, sync = True, False
-            elif overwrite_mode == "2":
-                overwrite, sync = False, True
-            else:
-                overwrite, sync = False, False
-
-            advanced_options['matrix'] = use_matrix
-            advanced_options['basic'] = use_basic
-            advanced_options['target_icc'] = target_icc if target_icc else None
-            advanced_options['no_icc_cleanup'] = no_cleanup
-            advanced_options['overwrite'] = overwrite
-            advanced_options['sync'] = sync
-            advanced_options['delete_source'] = delete_src
-
-        else:
-            # jxl_jpeg_transcoder advanced options
-            if RICH_AVAILABLE and console:
-                no_md5 = Confirm.ask("Skip MD5 verification? (faster)", default=False)
-                no_verify = Confirm.ask("Skip validation? (faster, risky)", default=False)
-                overwrite_mode = workflow.get('overwrite_mode', '2')
-                delete_src = Confirm.ask("Delete source after conversion?", default=False)
-                output_suffix = Prompt.ask("Output suffix (e.g., _converted)", default="")
-            else:
-                md5_input = input("Skip MD5 verification? [y/N]: ").strip().lower()
-                no_md5 = md5_input.startswith('y')
-                verify_input = input("Skip validation? [y/N]: ").strip().lower()
-                no_verify = verify_input.startswith('y')
-                overwrite_mode = workflow.get('overwrite_mode', '2')
-                del_input = input("Delete source after? [y/N]: ").strip().lower()
-                delete_src = del_input.startswith('y')
-                output_suffix = input("Output suffix (e.g., _converted): ").strip()
-
-            # Parse overwrite mode
-            if overwrite_mode == "1":
-                overwrite, sync = True, False
-            elif overwrite_mode == "2":
-                overwrite, sync = False, True
-            else:
-                overwrite, sync = False, False
-
-            advanced_options['no_md5'] = no_md5
-            advanced_options['no_verify'] = no_verify
-            advanced_options['overwrite'] = overwrite
-            advanced_options['sync'] = sync
-            advanced_options['delete_source'] = delete_src
-            advanced_options['output_suffix'] = output_suffix if output_suffix else None
-
-        workflow['advanced_options'] = advanced_options
-        return self._wizard_parameters_expert(workflow)
-
-    def _wizard_parameters_expert(self, workflow: Dict) -> bool:
-        """Step 6B: Expert Mode (free-form flags)"""
-        if RICH_AVAILABLE and console:
-            console.print("\n[bold cyan]Step 6B: Expert Mode[/bold cyan]")
-            show_expert = Confirm.ask("Add custom command-line flags?", default=False)
-        else:
-            print("\n--- Step 6B: Expert Mode ---")
-            expert_input = input("Add custom flags? [y/N]: ").strip().lower()
-            show_expert = expert_input.startswith('y')
-
-        if show_expert:
-            if RICH_AVAILABLE and console:
-                console.print("[dim]Enter any additional flags as they would appear on command line:[/dim]")
-                console.print("[dim]Example: --strip --resize 50% --effort 10[/dim]")
-                expert_flags = Prompt.ask("Custom flags", default="")
-            else:
-                print("Enter additional flags (e.g., --strip --resize 50% --effort 10):")
-                expert_flags = input("> ").strip()
-
-            workflow['expert_flags'] = expert_flags
-
-        return True
-
     def _wizard_confirm(self, workflow: Dict) -> bool:
         """Step 7: Final Confirmation"""
         mode_names = {
@@ -1354,6 +1321,51 @@ class InteractiveMenu:
                 print("Cancelling...\n")
                 return False
             return True
+
+    def run_wizard(self, status: Dict[str, bool]) -> Optional[Dict[str, Any]]:
+        """Main workflow wizard with 3-tier parameters"""
+        # Initialize with memorized or default values
+        last_staging = self.config.config.last_staging
+        if last_staging is None:
+            last_staging = self.config.config.staging_dir
+
+        workflow = {
+            'input_dir': None,
+            'origin_format': None,
+            'dest_format': None,
+            'conversion_type': None,
+            'mode': None,
+            'workers': self.config.config.last_workers or self.config.config.default_workers,
+            'quality': self.config.config.last_quality or self.config.config.default_quality,
+            'effort': self.config.config.last_effort or self.config.config.default_effort,
+            'staging': last_staging,
+            'selected_files': [],
+            'icc_profile': None,
+            'use_ram': True,
+            'compression': 'zip',
+            'bit_depth': 16,
+            'dry_run': False,
+            'advanced_options': {},
+            'expert_flags': '',
+            'mode_config': {},
+        }
+
+        if not self._wizard_select_origin(workflow, status):
+            return None
+        if not self._wizard_select_destination(workflow, status):
+            return None
+        if not self._wizard_select_files(workflow):
+            return None
+        if not self._wizard_select_mode(workflow):
+            return None
+        if not self._wizard_mode_specific_config(workflow):
+            return None
+        if not self._wizard_parameters_basic(workflow, status):
+            return None
+        if not self._wizard_confirm(workflow):
+            return None
+
+        return workflow
 
     def execute_workflow(self, workflow: Dict, status: Dict[str, bool]) -> bool:
         """Execute the workflow - Build command dynamically"""
@@ -1564,18 +1576,6 @@ class InteractiveMenu:
         except Exception as e:
             self._print_error(f"Error executing: {e}")
             return False
-
-    def _print_success(self, message: str) -> None:
-        if RICH_AVAILABLE and console:
-            console.print(f"[green]✓[/green] {message}")
-        else:
-            print(f"✓ {message}")
-
-    def _print_error(self, message: str) -> None:
-        if RICH_AVAILABLE and console:
-            console.print(f"[red]✗[/red] {message}")
-        else:
-            print(f"✗ {message}")
 
 
 def main():
